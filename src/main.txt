@@ -1,0 +1,115 @@
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "esp_log.h"
+#include "usb/usb_host.h"
+
+#define CLASS_DRIVER_ACTION_OPEN_DEV 0x01
+#define CLASS_DRIVER_ACTION_TRANSFER 0x02
+#define CLASS_DRIVER_ACTION_CLOSE_DEV 0x03
+
+struct class_driver_control
+{
+    uint32_t actions;
+    uint8_t dev_addr;
+    usb_host_client_handle_t client_hdl;
+    usb_device_handle_t dev_hdl;
+};
+
+static void client_event_cb(const usb_host_client_event_msg_t *event_msg, void *arg)
+{
+    printf("\nThis is function is called from within usb_host_client_handle_events(). Don't block and try to keep it short");
+    struct class_driver_control *class_driver_obj = (struct class_driver_control *)arg;
+    switch (event_msg->event)
+    {
+    case USB_HOST_CLIENT_EVENT_NEW_DEV:
+        class_driver_obj->actions |= CLASS_DRIVER_ACTION_OPEN_DEV;
+        class_driver_obj->dev_addr = event_msg->new_dev.address; 
+        printf("\nStore the address of the new device");
+        break;
+    case USB_HOST_CLIENT_EVENT_DEV_GONE:
+        class_driver_obj->actions |= CLASS_DRIVER_ACTION_CLOSE_DEV;
+        break;
+    default:
+        break;
+    }
+}
+
+static void transfer_cb(usb_transfer_t *transfer)
+{
+    printf("\nThis is function is called from within usb_host_client_handle_events(). Don't block and try to keep it short");
+    struct class_driver_control *class_driver_obj = (struct class_driver_control *)transfer->context;
+    printf("Transfer status %d, actual number of bytes transferred %d\n", transfer->status, transfer->actual_num_bytes);
+    class_driver_obj->actions |= CLASS_DRIVER_ACTION_CLOSE_DEV;
+}
+
+void client_task(void *arg)
+{
+    printf("\nInitialize class driver objects");
+    struct class_driver_control class_driver_obj = {0};
+    printf("\nRegister the client");
+    usb_host_client_config_t client_config = {
+        .is_synchronous = false,
+        .max_num_event_msg = 5,
+        .async = {
+            .client_event_callback = client_event_cb,
+            .callback_arg = &class_driver_obj,
+        }};
+    usb_host_client_register(&client_config, &class_driver_obj.client_hdl);
+    printf("\nAllocate a USB transfer");
+    usb_transfer_t *transfer;
+    usb_host_transfer_alloc(1024, 0, &transfer);
+
+    printf("\nevent handling loop");
+    bool exit = false;
+    printf("\nCall the client event handler function");
+    while (!exit)
+    {
+        usb_host_client_handle_events(class_driver_obj.client_hdl, portMAX_DELAY);
+        printf("\n (%d)", class_driver_obj.actions);
+            
+        if (class_driver_obj.actions & CLASS_DRIVER_ACTION_OPEN_DEV)
+        {
+            printf("\nOpen the device and claim interface 1");
+            usb_host_device_open(class_driver_obj.client_hdl, class_driver_obj.dev_addr, &class_driver_obj.dev_hdl);
+            usb_host_interface_claim(class_driver_obj.client_hdl, class_driver_obj.dev_hdl, 1, 0);
+        }
+        if (class_driver_obj.actions & CLASS_DRIVER_ACTION_TRANSFER)
+        {
+            printf("\nSend an OUT transfer to EP1");
+            memset(transfer->data_buffer, 0xAA, 1024);
+            transfer->num_bytes = 1024;
+            transfer->device_handle = class_driver_obj.dev_hdl;
+            transfer->bEndpointAddress = 0x01;
+            transfer->callback = transfer_cb;
+            transfer->context = (void *)&class_driver_obj;
+            usb_host_transfer_submit(transfer);
+        }
+        if (class_driver_obj.actions & CLASS_DRIVER_ACTION_CLOSE_DEV)
+        {
+            printf("\nRelease the interface and close the device");
+            usb_host_interface_release(class_driver_obj.client_hdl, class_driver_obj.dev_hdl, 1);
+            usb_host_device_close(class_driver_obj.client_hdl, class_driver_obj.dev_hdl);
+            exit = true;
+        }
+        vTaskDelay(5);
+    }
+    printf("\nExecute pending class driver actions");
+    printf("\nCleanup class driver");
+    usb_host_transfer_free(transfer);
+    usb_host_client_deregister(class_driver_obj.client_hdl);
+    printf("\nDelete the task and any other signal Daemon Task if required");
+}
+
+
+void setup (){
+    usb_host_config_t host_config = {
+        .skip_phy_setup = false,
+        .intr_flags = ESP_INTR_FLAG_LEVEL1,
+    };
+    ESP_ERROR_CHECK(usb_host_install(&host_config));
+    TaskHandle_t host_lib_task_hdl, class_driver_task_hdl;
+    xTaskCreatePinnedToCore(client_task,"class",4096,NULL,10,&class_driver_task_hdl,0);
+}
+
+void loop(){}
